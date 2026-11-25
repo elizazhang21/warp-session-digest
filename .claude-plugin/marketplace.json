@@ -1,0 +1,13 @@
+{
+  "name": "warp-session-digest",
+  "description": "Warp session list shows what each Claude Code session is doing",
+  "owner": { "name": "elizazhang21" },
+  "plugins": [
+    {
+      "name": "warp-digest",
+      "description": "Warp notifications + session-list summaries (fork of Warp's official plugin)",
+      "source": "./claude-plugin",
+      "version": "2.4.0-digest.1"
+    }
+  ]
+}

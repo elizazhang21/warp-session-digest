@@ -132,7 +132,8 @@ def cc_targets(scope_since, live, procs):
                 continue
             path = cc_transcript_path(meta["sessionId"])
             if path:
-                targets.append({"path": path, "status": meta.get("status"), "pid": pid, "tty": procs[pid][0]})
+                targets.append({"path": path, "status": meta.get("status"), "pid": pid, "tty": procs[pid][0],
+                                "session_id": meta["sessionId"], "session_cwd": meta.get("cwd")})
     else:
         for path in glob.glob(f"{CC_PROJECTS}/*/*.jsonl"):
             if "-private-tmp-" in path or "-private-var-" in path:

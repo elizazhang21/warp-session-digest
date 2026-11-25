@@ -1,0 +1,7 @@
+{
+  "name": "warp-digest",
+  "description": "Fork of Warp's Claude Code plugin (warpdotdev/claude-code-warp 2.4.0, MIT): same notifications, but the Warp session list / completion notification show a one-line summary of the session instead of the last prompt.",
+  "version": "2.4.0-digest.1",
+  "author": { "name": "elizazhang21" },
+  "homepage": "https://github.com/elizazhang21/warp-session-digest"
+}

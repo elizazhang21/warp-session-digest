@@ -1,8 +1,20 @@
 # warp-session-digest
 
-Summarize what your terminal AI coding sessions (Claude Code and agy / Antigravity CLI) are doing — one Warp workflow, one report: what each session is working on, progress, status, and what needs you.
+Make Warp's session list say what each AI coding session (Claude Code, agy / Antigravity CLI) is actually doing — instead of its last prompt — plus an on-demand report across all sessions.
 
-## Install
+## Session-list labels
+
+```sh
+./install-titles.sh
+```
+
+- Installs a launchd agent running `titles.py` every 30s: finds live sessions, re-summarizes changed ones (one batched `claude -p --model haiku` call), caches them in `~/.cache/warp-session-digest/titles.json`.
+- **agy**: label = terminal title (`● busy` / `○ idle`).
+- **Claude Code**: Warp labels it with the `query` of its `warp://cli-agent` events, not the title. While busy, `titles.py` sends a `prompt_submit` event with the summary (no notification). When a turn ends, the forked Warp plugin in `claude-plugin/` (fork of [warpdotdev/claude-code-warp](https://github.com/warpdotdev/claude-code-warp) 2.4.0, MIT; only `on-stop.sh` changed) puts the summary in the completion notification — but only if it was generated after the last prompt.
+- The installer swaps the official `warp@claude-code-warp` plugin for `warp-digest@warp-session-digest`. Open Claude sessions need `/reload-plugins`.
+- Uninstall: `launchctl bootout gui/$(id -u)/com.user.warp-session-titles`, delete `~/Library/LaunchAgents/com.user.warp-session-titles.plist`, `claude plugin uninstall warp-digest@warp-session-digest`, `claude plugin enable warp@claude-code-warp`.
+
+## On-demand report
 
 ```sh
 git clone https://github.com/elizazhang21/warp-session-digest && cd warp-session-digest && ./install.sh
