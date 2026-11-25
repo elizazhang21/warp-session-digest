@@ -32,6 +32,7 @@ except re.error as err:
 EDIT_TOOLS_CC = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 NOISE_PREFIX = ("<local-command", "<task-notification", "<system-reminder", "<bash-input", "<bash-stdout", "<bash-stderr", "Caveat:", "[Request interrupted", "This session is being continued")
 CLAUDE_TIMEOUT_S = 300
+SUMMARY_LANG = os.environ.get("DIGEST_LANG", "English")  # language of generated summaries and labels
 NO_TTY = ("??", "?", "-")  # macOS / Linux ps spelling of "no controlling terminal"
 
 
@@ -342,44 +343,44 @@ def cmd_snip(c, n=160):
 def render(d, max_prompts=12):
     home = lambda p: (p or "").replace(HOME, "~")
     hm = lambda t: t.strftime("%m-%d %H:%M") if t else "?"
-    lines = [f"### [{d['tool']}] {d.get('title') or '(无标题)'}"]
-    meta = f"cwd: {home(d['cwd'])} | 活跃: {hm(d['first'])} → {hm(d['last'])}"
+    lines = [f"### [{d['tool']}] {d.get('title') or '(untitled)'}"]
+    meta = f"cwd: {home(d['cwd'])} | active: {hm(d['first'])} → {hm(d['last'])}"
     if d.get("status"):
-        meta += f" | 状态: {d['status']}"
+        meta += f" | status: {d['status']}"
     if d.get("tty"):
         meta += f" | {d['tty']}"
     lines.append(meta)
     prompts = d["prompts"]
     if len(prompts) > max_prompts:
-        lines.append(f"用户指令（共 {len(prompts)} 条，首条 + 最近 {max_prompts - 1} 条）:")
+        lines.append(f"User prompts ({len(prompts)} total; first + last {max_prompts - 1}):")
         prompts = prompts[:1] + prompts[-(max_prompts - 1):]
     else:
-        lines.append("用户指令:")
+        lines.append("User prompts:")
     lines += [f"- {hm(ts)} {clip(p, 300)}" for ts, p in prompts]
     edits = uniq(home(p) for p in d["edits"])
     if edits:
-        lines.append(f"改过的文件（{len(edits)}）: " + ", ".join(edits[:20]) + (" …" if len(edits) > 20 else ""))
+        lines.append(f"Files edited ({len(edits)}): " + ", ".join(edits[:20]) + (" …" if len(edits) > 20 else ""))
     cmds = uniq(cmd_snip(c) for c in d["cmds"])
     if cmds:
-        lines.append("关键命令:")
+        lines.append("Notable commands:")
         lines += [f"- `{c}`" for c in cmds[-10:]]
     if d["replies"]:
-        lines.append("最后的回复:")
+        lines.append("Last replies:")
         lines += [f"> {clip(r, 700)}" for r in d["replies"][-2:]]
     return "\n".join(lines)
 
 
-PROMPT = """下面是我在终端里同时开着的若干 AI 编码会话（Claude Code / agy）的原始摘录。
-请用中文写一份简洁的工作总结，markdown 格式：
+PROMPT = """Below are raw excerpts from several AI coding sessions (Claude Code / agy) I have open in my terminal.
+Write a concise work summary in markdown, in {lang}:
 
-1. 开头 2–3 句总览：今天主要在推进哪几件事。
-2. 每个会话一节，标题用「会话标题 · 仓库名」，下面三行：
-   - **在做**：一句话说目标。
-   - **进展**：做了哪些实质改动/结论（改了什么、提交/MR/发布到哪一步），不罗列文件。
-   - **状态**：完成 / 进行中 / 卡住（卡在哪）/ 等我决定（要我决定什么）。
-3. 最后「需要我处理」列表：只列真正需要人介入的事项；没有就写「无」。
+1. Open with a 2-3 sentence overview: which threads of work are in progress today.
+2. One section per session, headed "<session title, translated into {lang} if needed> · <repo>", with three lines:
+   - **Goal**: one sentence.
+   - **Progress**: substantive changes/conclusions (what changed, how far commit/PR/deploy got); don't list files.
+   - **Status**: done / in progress / blocked (on what) / waiting on me (for what decision).
+3. End with a "Needs me" list: only items that truly need a human; write "None" if there are none.
 
-只根据摘录说话，不确定就写「从记录看不出」。不要重复原始指令原文，不要客套。
+Only use what the excerpts say; if unsure, write "unclear from the log". Don't quote the prompts verbatim, no pleasantries.
 
 ---
 {body}
@@ -389,8 +390,8 @@ PROMPT = """下面是我在终端里同时开着的若干 AI 编码会话（Clau
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scope", default="live", help="live | today | <N>h  (default live)")
-    ap.add_argument("--raw", action="store_true", help="只打印抽取的原始摘录，不调用 LLM")
-    ap.add_argument("--model", default="sonnet", help="claude -p 用的模型 (default sonnet)")
+    ap.add_argument("--raw", action="store_true", help="print the extracted digest only; no LLM call")
+    ap.add_argument("--model", default="sonnet", help="model for claude -p (default sonnet)")
     ap.add_argument("--tool", choices=["all", "claude", "agy"], default="all")
     args = ap.parse_args()
 
@@ -417,7 +418,7 @@ def main():
     digests = [d for d in digests if keep(d)]
     digests.sort(key=lambda d: d["last"] or n, reverse=True)
     if not digests:
-        print(f"没有找到 {args.scope} 范围内有活动的会话。")
+        print(f"No sessions with activity in scope {args.scope}.")
         return
 
     body = "\n\n".join(render(d) for d in digests)
@@ -425,15 +426,15 @@ def main():
         print(body)
         return
 
-    print(f"总结 {len(digests)} 个会话（{args.scope}，{args.model}）…", file=sys.stderr)
+    print(f"Summarizing {len(digests)} sessions ({args.scope}, {args.model})…", file=sys.stderr)
     cmd = ["claude", "-p", "--model", args.model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
     try:
-        r = subprocess.run(cmd, input=PROMPT.format(body=body), capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S)
+        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=SUMMARY_LANG), capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        print(f"claude -p 超时（{CLAUDE_TIMEOUT_S}s）\n--- 原始摘录 ---\n{body}")
+        print(f"claude -p timed out ({CLAUDE_TIMEOUT_S}s)\n--- raw digest ---\n{body}")
         sys.exit(1)
     if r.returncode != 0 or not r.stdout.strip():
-        print(f"claude -p 失败 (exit={r.returncode}): {r.stderr.strip()[:500]}\n--- 原始摘录 ---\n{body}")
+        print(f"claude -p failed (exit={r.returncode}): {r.stderr.strip()[:500]}\n--- raw digest ---\n{body}")
         sys.exit(1)
     print(r.stdout.strip())
 

@@ -27,12 +27,13 @@ STATE = os.environ.get("WARP_DIGEST_STATE") or os.path.expanduser("~/.cache/warp
 REFRESH_S = 180          # min seconds between re-summaries of one session (a new prompt bypasses this)
 BUSY_WINDOW_S = 60       # agy has no status file: busy = transcript written within this window
 SETTLE_S = 5             # don't relabel a Claude session whose busy/idle status flipped this recently
-TITLE_MAX = 28
+TITLE_MAX = 48
 CLAUDE_TIMEOUT_S = 120
 
-PROMPT = """为下面每个 AI 编码会话写一个标题，概括它**现在**在做什么、到哪一步了。
-要求：中文，≤18 个字，像任务名 + 状态，例如「合并今日改动成 MR·冲突处理中」「Grafana 加滞后说明·等扫描」。
-以最近的用户指令为准，不要写仓库名，不要标点结尾。只输出 JSON 对象：{{"<key>": "<标题>", ...}}，key 用每节开头的 key。
+PROMPT = """Write a label for each AI coding session below: what it is doing **right now** and how far along it is.
+Rules: in {lang}, at most 6 words / 40 characters, task + state, e.g. "Squash today's changes into PR · resolving conflicts",
+"Grafana lag note · waiting on scan". Base it on the most recent user prompt; no repo name, no trailing punctuation.
+Output only a JSON object {{"<key>": "<label>", ...}} using the key at the top of each section.
 
 {body}
 """
@@ -82,7 +83,7 @@ def summarize(items, model):
     body = "\n\n".join(f"key: {k}\n" + digest.render(d, max_prompts=6) for k, d in items)
     cmd = [claude, "-p", "--model", model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
     try:
-        r = subprocess.run(cmd, input=PROMPT.format(body=body), capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S)
+        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=digest.SUMMARY_LANG), capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         print(f"{time.ctime()} claude -p timed out", file=sys.stderr)
         return {}
@@ -101,7 +102,7 @@ def summarize(items, model):
 
 
 def clean(title):
-    title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", title).replace(";", "；").strip()
+    title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", title).replace(";", ",").strip()
     return title if len(title) <= TITLE_MAX else title[: TITLE_MAX - 1] + "…"
 
 
