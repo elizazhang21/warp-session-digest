@@ -30,7 +30,7 @@ try:
 except re.error as err:
     sys.exit(f"bad DIGEST_EXTRA_CMDS regex: {err}")
 EDIT_TOOLS_CC = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-NOISE_PREFIX = ("<local-command", "<task-notification", "<system-reminder", "<bash-input", "<bash-stdout", "<bash-stderr", "Caveat:", "[Request interrupted", "This session is being continued")
+NOISE_PREFIX = ("<local-command", "<task-notification", "<system-reminder", "<bash-input", "<bash-stdout", "<bash-stderr", "Caveat: The messages below", "[Request interrupted", "This session is being continued")
 CLAUDE_TIMEOUT_S = 300
 SUMMARY_LANG = os.environ.get("DIGEST_LANG", "English")  # language of generated summaries and labels
 NO_TTY = ("??", "?", "-")  # macOS / Linux ps spelling of "no controlling terminal"
@@ -115,6 +115,39 @@ def cc_session_registry():
     return out
 
 
+def cc_prompt(e, local):
+    """(prompt text or None, new `local` flag) for one transcript entry. Same rules as claude-plugin/scripts/digest-label.sh:
+    typed prompts and mid-turn queued prompts count; injected noise, meta entries, and local slash commands
+    (/model, /clear, ... — preceded by a <local-command-caveat> meta entry) don't."""
+    typ = e.get("type")
+    if typ == "attachment":
+        a = e.get("attachment") or {}
+        if a.get("type") == "queued_command" and a.get("commandMode") == "prompt" and isinstance(a.get("prompt"), str):
+            txt = strip_tags(a["prompt"])
+            return (txt if txt and not txt.startswith(NOISE_PREFIX) else None), local
+        return None, local
+    if typ != "user" or e.get("isSidechain") or e.get("isCompactSummary"):
+        return None, local
+    content = (e.get("message") or {}).get("content")
+    texts = [content] if isinstance(content, str) else [b.get("text") or "" for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+    if e.get("isMeta"):
+        return None, local or any(t.lstrip().startswith("<local-command-caveat") for t in texts)
+    out = []
+    for txt in texts:
+        name = re.search(r"<command-name>(.*?)</command-name>", txt, re.S)
+        if name:
+            if local or "<command-message>" not in txt:
+                return None, False  # local command, not a task
+            cargs = re.search(r"<command-args>(.*?)</command-args>", txt, re.S)
+            txt = f"{name.group(1)} {cargs.group(1) if cargs else ''}"
+        elif txt.lstrip().startswith(NOISE_PREFIX):
+            continue
+        txt = strip_tags(txt)
+        if txt:
+            out.append(txt)
+    return (" ".join(out) or None), False  # any non-meta user turn ends the local-command window
+
+
 def cc_transcript_path(session_id):
     hits = glob.glob(f"{CC_PROJECTS}/*/{session_id}.jsonl")
     return max(hits, key=os.path.getmtime) if hits else None
@@ -152,7 +185,7 @@ def new_digest(tool, **kw):
 
 def cc_digest(t, since):
     d = new_digest("Claude Code", **{k: t[k] for k in ("status", "pid", "tty") if t.get(k)})
-    custom_title = None
+    custom_title, local = None, False
     for line in open(t["path"], errors="replace"):
         try:
             e = json.loads(line)
@@ -165,7 +198,12 @@ def cc_digest(t, since):
             d["title"] = e.get("aiTitle")
         elif typ == "custom-title":
             custom_title = e.get("customTitle")
+        prompt, local = cc_prompt(e, local)
         if typ not in ("user", "assistant") or e.get("isSidechain") or e.get("isMeta") or e.get("isCompactSummary"):
+            if prompt:  # queued mid-turn prompt (attachment entry)
+                ts = parse_ts((e.get("attachment") or {}).get("timestamp") or e.get("timestamp"))
+                if not ts or ts >= since:
+                    d["prompts"].append((ts, prompt))
             continue
         if e.get("entrypoint"):
             d["entrypoint"] = e["entrypoint"]
@@ -176,23 +214,14 @@ def cc_digest(t, since):
         if ts:
             d["first"] = d["first"] or ts
             d["last"] = ts
+        if prompt:
+            d["prompts"].append((ts, prompt))
         content = (e.get("message") or {}).get("content")
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else (content or [])
         for b in blocks:
             if not isinstance(b, dict):
                 continue
-            if typ == "user" and b.get("type") == "text":
-                txt = b.get("text") or ""
-                name = re.search(r"<command-name>(.*?)</command-name>", txt, re.S)
-                if name:
-                    cargs = re.search(r"<command-args>(.*?)</command-args>", txt, re.S)
-                    txt = f"{name.group(1)} {cargs.group(1) if cargs else ''}"
-                elif txt.lstrip().startswith(NOISE_PREFIX):
-                    continue
-                txt = strip_tags(txt)
-                if txt:
-                    d["prompts"].append((ts, txt))
-            elif typ == "assistant" and b.get("type") == "text" and (b.get("text") or "").strip():
+            if typ == "assistant" and b.get("type") == "text" and (b.get("text") or "").strip():
                 d["replies"].append(b["text"])
             elif typ == "assistant" and b.get("type") == "tool_use":
                 inp = b.get("input") or {}

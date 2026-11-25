@@ -131,21 +131,19 @@ def cc_tail(path, nbytes=512 * 1024):
             lines = f.read().decode("utf-8", "replace").splitlines()[1:]
     except OSError:
         return 0.0, False
-    prompt_ts, ended = 0.0, False
+    prompt_ts, ended, local = 0.0, False, False
     for line in lines:
         try:
             e = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(e, dict) or e.get("isSidechain") or e.get("isMeta") or e.get("isCompactSummary"):
+        if not isinstance(e, dict):
             continue
-        content = (e.get("message") or {}).get("content")
-        if e.get("type") == "user":
-            texts = [content] if isinstance(content, str) else [b.get("text") or "" for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
-            if any(t.strip() and not t.lstrip().startswith(digest.NOISE_PREFIX) for t in texts):
-                ts = digest.parse_ts(e.get("timestamp"))
-                prompt_ts, ended = (ts.timestamp() if ts else prompt_ts), False
-        elif e.get("type") == "assistant":
+        prompt, local = digest.cc_prompt(e, local)
+        if prompt:
+            ts = digest.parse_ts((e.get("attachment") or {}).get("timestamp") or e.get("timestamp"))
+            prompt_ts, ended = (ts.timestamp() if ts else prompt_ts), False
+        elif e.get("type") == "assistant" and not e.get("isSidechain"):
             ended = (e.get("message") or {}).get("stop_reason") == "end_turn"
     return prompt_ts, ended
 
