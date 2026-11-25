@@ -1,0 +1,13 @@
+---
+name: 总结 AI 会话（Claude Code / agy）
+command: python3 __REPO__/digest.py --scope {{scope}}
+tags:
+  - ai
+  - claude
+  - agy
+description: 汇总当前终端里各个 Claude Code / agy 会话在做什么、进展、状态和需要我处理的事项。
+arguments:
+  - name: scope
+    description: "live=当前开着的会话；today=今天所有会话；8h=最近 8 小时。加 --raw 只看原始摘录"
+    default_value: live
+shells: []
