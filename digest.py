@@ -14,11 +14,16 @@ import datetime as dt
 import glob
 import json
 import os
+import queue
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 
 IS_WIN = sys.platform == "win32"
 HOME = os.path.expanduser("~")
@@ -26,6 +31,8 @@ CC_SESSIONS = os.path.join(HOME, ".claude", "sessions")
 CC_PROJECTS = os.path.join(HOME, ".claude", "projects")
 AGY = os.path.join(HOME, ".gemini", "antigravity-cli")
 AGY_TRANSCRIPT = os.path.join(AGY, "brain", "{}", ".system_generated", "logs", "transcript.jsonl")
+AGY_PRINT = re.compile(r"(?:^(\S*[/\\])?agy(\.exe)?\s+acp(\s|$)|\s(-p|--print|--prompt)(=|\s|$))", re.I)  # headless/ACP agy (e.g. our own summarizer), never a terminal session
+AGY_WORKDIR = os.path.join(HOME, ".cache", "warp-session-digest", "agy")  # cwd & isolated ACP state parent, so summarizer calls never touch a real workspace or ~/.gemini/antigravity-cli
 
 # Commands worth surfacing in the digest; extend with DIGEST_EXTRA_CMDS (a regex alternation, e.g. "mycli deploy|ship\.sh").
 _EXTRA_CMDS = os.environ.get("DIGEST_EXTRA_CMDS", "").strip("|")
@@ -35,7 +42,7 @@ except re.error as err:
     sys.exit(f"bad DIGEST_EXTRA_CMDS regex: {err}")
 EDIT_TOOLS_CC = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 NOISE_PREFIX = ("<local-command", "<task-notification", "<system-reminder", "<bash-input", "<bash-stdout", "<bash-stderr", "Caveat: The messages below", "[Request interrupted", "This session is being continued")
-CLAUDE_TIMEOUT_S = 300
+LLM_TIMEOUT_S = 300
 SUMMARY_LANG = os.environ.get("DIGEST_LANG", "English")  # language of generated summaries and labels
 NO_TTY = ("??", "?", "-")  # macOS / Linux ps spelling of "no controlling terminal"
 
@@ -66,13 +73,6 @@ def strip_tags(s):
         s = re.sub(rf"<{tag}>.*?</{tag}>", "", s, flags=re.S)
     s = re.sub(r"</?USER_REQUEST>", "", s)
     return s.strip()
-
-
-def claude_bin():
-    found = shutil.which("claude")
-    if found:
-        return found
-    return "claude" if IS_WIN else "/opt/homebrew/bin/claude"
 
 
 def _win_proc_snapshot():
@@ -415,14 +415,18 @@ def agy_targets(scope_since, live, procs):
     if not live:
         ids = []
         for path in glob.glob(AGY_TRANSCRIPT.format("*")):
-            if dt.datetime.fromtimestamp(os.path.getmtime(path)).astimezone() >= scope_since:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue  # deleted since the glob
+            if dt.datetime.fromtimestamp(mtime).astimezone() >= scope_since:
                 cid = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
                 ids.append(cid)
         return [{"id": cid, "meta": meta.get(cid)} for cid in ids if cid not in own]
     # live: each agy process on a tty holds brain/<conversationId> dirs (or presence/<cid>.lock on Windows).
     targets, seen = [], set()
     for pid, (tty, _, cmd) in procs.items():
-        if tty in NO_TTY or not re.match(r"(\S*[/\\])?agy(\.exe)?(\s|$)", cmd, re.I) or pid in ancestors():
+        if tty in NO_TTY or not re.match(r"(\S*[/\\])?agy(\.exe)?(\s|$)", cmd, re.I) or AGY_PRINT.search(cmd) or pid in ancestors():
             continue
         convs = win_owners.get(pid, []) if IS_WIN else agy_open_convs(pid)
         for cid in convs:
@@ -445,8 +449,11 @@ def unquote(v):
 def agy_digest(t, since):
     title, ws = t.get("meta") or (None, None)
     d = new_digest("agy", title=title, cwd=ws, **{k: t[k] for k in ("pid", "tty") if t.get(k)})
-    with open(AGY_TRANSCRIPT.format(t["id"]), encoding="utf-8", errors="replace") as fh:
-        lines = list(fh)
+    try:
+        with open(AGY_TRANSCRIPT.format(t["id"]), encoding="utf-8", errors="replace") as fh:
+            lines = list(fh)
+    except OSError:
+        return d  # deleted since it was listed; no prompts, so keep() drops it
     for line in lines:
         try:
             e = json.loads(line)
@@ -485,6 +492,267 @@ def agy_digest(t, since):
     return d
 
 
+# ---------------- LLM ----------------
+
+def find_bin(name):
+    """launchd / Scheduled Task PATH may lack ~/.local/bin (where agy/claude install), so also try usual dirs."""
+    candidates = [shutil.which(name)]
+    if IS_WIN:
+        candidates += [os.path.join(HOME, ".local", "bin", f"{name}{ext}") for ext in (".exe", ".cmd")]
+    else:
+        candidates += [os.path.join(HOME, ".local", "bin", name), f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}"]
+    for p in candidates:
+        if p and os.path.isfile(p) and (IS_WIN or os.access(p, os.X_OK)):
+            return p
+    return None
+
+
+def pick_backend(preferred):
+    """preferred if installed, else the other one, else preferred (the call then reports it can't run)."""
+    other = "claude" if preferred == "agy" else "agy"
+    return preferred if find_bin(preferred) or not find_bin(other) else other
+
+
+def agy_configured_model():
+    try:
+        with open(os.path.join(AGY, "settings.json"), encoding="utf-8", errors="replace") as f:
+            m = json.load(f).get("model")
+        return m.strip() if isinstance(m, str) and m.strip() else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def agy_resolve_model(requested, available):
+    """Map an explicit model slug/display name (or settings.json default when requested is None) to an ACP modelId."""
+    target = requested or agy_configured_model()
+    if not target:
+        return None
+    for m in available or []:
+        if isinstance(m, dict) and target in (m.get("modelId"), m.get("name")):
+            return m.get("modelId")
+    # explicit bad --agy-model should reach session/set_model and error; stale settings.json falls back to ACP default
+    return requested
+
+
+def agy_acp(exe, prompt, model, timeout):
+    """One isolated `agy acp` turn: writes state to a per-call dir under AGY_WORKDIR, never ~/.gemini/antigravity-cli."""
+    os.makedirs(AGY_WORKDIR, exist_ok=True)
+    state_dir = tempfile.mkdtemp(dir=AGY_WORKDIR, prefix="acp-")
+    gemini_dir = os.path.relpath(state_dir, HOME)
+    cmd = [exe, "acp", "--gemini-dir", gemini_dir, "--app-data-dir", "state", "--include-default-customizations=false", "--disable-telemetry"]
+    popen_kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {"start_new_session": True}
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=AGY_WORKDIR, **popen_kw)
+    except OSError as e:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        return False, f"cannot run agy: {e}"
+
+    deadline = time.monotonic() + timeout
+    out_q, err_chunks, chunks = queue.Queue(), [], []
+    timed_out, done, proc_lock = threading.Event(), threading.Event(), threading.Lock()
+    reaped = False
+
+    def terminate_proc(force=False):
+        with proc_lock:
+            if reaped:
+                return
+            try:
+                if IS_WIN:
+                    if force:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, timeout=3,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    else:
+                        p.terminate()
+                else:
+                    os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError, subprocess.SubprocessError):
+                if IS_WIN and force:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+
+    def on_timeout():
+        timed_out.set()
+        terminate_proc(force=False)
+        if not done.wait(3):
+            terminate_proc(force=True)
+
+    def read_stdout():
+        try:
+            for raw in p.stdout:
+                out_q.put(raw)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                p.stdout.close()
+            except OSError:
+                pass
+            out_q.put(None)
+
+    def read_stderr():
+        kept = 0
+        try:
+            while True:
+                data = p.stderr.read(65536)
+                if not data:
+                    break
+                if kept < 65536:
+                    take = data[: 65536 - kept]
+                    err_chunks.append(take)
+                    kept += len(take)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                p.stderr.close()
+            except OSError:
+                pass
+
+    timer = threading.Timer(timeout, on_timeout)
+    timer.daemon = True
+    t_out = threading.Thread(target=read_stdout, daemon=True)
+    t_err = threading.Thread(target=read_stderr, daemon=True)
+    timer.start()
+    t_out.start()
+    t_err.start()
+
+    def stderr_text(wait_s=0.3):
+        t_err.join(timeout=wait_s)
+        return b"".join(list(err_chunks)).decode("utf-8", "replace").strip()
+
+    def send(obj):
+        if timed_out.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError()
+        p.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+        p.stdin.flush()
+
+    def recv(want_id):
+        while True:
+            rem = deadline - time.monotonic()
+            if timed_out.is_set() or rem <= 0:
+                raise TimeoutError()
+            try:
+                raw = out_q.get(timeout=rem)
+            except queue.Empty:
+                raise TimeoutError()
+            if raw is None:
+                return None
+            if not raw.strip():
+                continue
+            try:
+                msg = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if "method" in msg and msg.get("id") is not None:
+                # server-initiated request (e.g. tool permission): deny so no tool can run and server never hangs
+                if msg["method"] == "session/request_permission":
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": {"outcome": "cancelled"}}})
+                else:
+                    send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "not supported"}})
+            elif msg.get("method") == "session/update":
+                upd = (msg.get("params") or {}).get("update") or {}
+                if upd.get("sessionUpdate") == "agent_message_chunk":
+                    c = upd.get("content") or {}
+                    if c.get("type") == "text":
+                        chunks.append(c.get("text") or "")
+            elif msg.get("id") == want_id:
+                return msg
+
+    def rpc(req_id, method, params):
+        send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        resp = recv(req_id)
+        if resp is None:
+            if timed_out.is_set():
+                raise TimeoutError()
+            err_txt = stderr_text()
+            return None, f"agy acp exited during {method}" + (f": {err_txt[:500]}" if err_txt else "")
+        if resp.get("error") is not None:
+            err = resp["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            return None, f"agy acp {method} failed: {msg}"
+        return resp.get("result") or {}, None
+
+    try:
+        _, err = rpc(1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        if err:
+            return False, err
+        res, err = rpc(2, "session/new", {"cwd": AGY_WORKDIR, "mcpServers": []})
+        if err:
+            return False, err
+        sid = res.get("sessionId")
+        if not sid:
+            return False, "agy acp session/new returned no sessionId"
+        models_info = res.get("models") or {}
+        target_model = agy_resolve_model(model, models_info.get("availableModels"))
+        if target_model and target_model != models_info.get("currentModelId"):
+            _, err = rpc(3, "session/set_model", {"sessionId": sid, "modelId": target_model})
+            if err:
+                return False, err
+        res, err = rpc(4, "session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": prompt}]})
+        if err:
+            return False, err
+        out = "".join(chunks).strip()
+        stop = res.get("stopReason")
+        if stop not in (None, "end_turn", "max_tokens") or not out:
+            err_txt = stderr_text()
+            return False, f"agy acp failed (stopReason={stop}): {err_txt[:500]}"
+        return True, out
+    except TimeoutError:
+        return False, f"agy acp timed out ({timeout}s)"
+    except OSError as e:
+        if timed_out.is_set():
+            return False, f"agy acp timed out ({timeout}s)"
+        err_txt = stderr_text()
+        return False, f"agy acp I/O error ({e})" + (f": {err_txt[:500]}" if err_txt else "")
+    finally:
+        done.set()
+        timer.cancel()
+        timer.join(timeout=5)
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        terminate_proc(force=False)
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            terminate_proc(force=True)
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        with proc_lock:
+            reaped = p.poll() is not None
+        t_out.join(timeout=0.5)
+        t_err.join(timeout=0.5)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def llm(prompt, backend, model, timeout):
+    """One non-interactive call. backend: claude | agy; model None = the CLI's default. Returns (ok, text or error)."""
+    exe = find_bin(backend)
+    if not exe:
+        return False, f"cannot run {backend}: not found"
+    if backend == "agy":
+        return agy_acp(exe, prompt, model, timeout)
+    cmd = [exe, "-p", "--no-session-persistence", "--tools", "", "--setting-sources", ""] + (["--model", model] if model else [])
+    kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {}
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **kw)
+        stdout, stderr, rc = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired:
+        return False, f"claude -p timed out ({timeout}s)"
+    except OSError as e:
+        return False, f"cannot run {backend}: {e}"
+    if rc != 0 or not (stdout or "").strip():
+        return False, f"claude -p failed (exit={rc}): {(stderr or stdout or '').strip()[:500]}"
+    return True, stdout.strip()
+
+
 # ---------------- render ----------------
 
 def is_probe(d):
@@ -492,11 +760,17 @@ def is_probe(d):
     return len(d["prompts"]) <= 1 and sum(len(p) for _, p in d["prompts"]) < 40 and not d["edits"] and not d["cmds"]
 
 
+def is_summarizer(d):
+    return bool(d["prompts"]) and d["prompts"][0][1].startswith(SUMMARIZER_PROMPT_HEADS)
+
+
 def keep(d):
     if not d["prompts"]:
         return False  # agy subagents and SDK warm-ups have no human input
     if (d.get("entrypoint") or "").startswith("sdk"):
         return False  # headless claude -p / orchestrator sessions
+    if is_summarizer(d):
+        return False  # legacy summarizer conversations, if any remain in ~/.gemini/antigravity-cli/brain
     return not is_probe(d)
 
 
@@ -563,6 +837,8 @@ Only use what the excerpts say; if unsure, write "unclear from the log". Don't q
 ---
 {body}
 """
+# first words of the prompts digest.py / titles.py send; keep() drops agy conversations that start with them
+SUMMARIZER_PROMPT_HEADS = ("Below are raw excerpts from several AI coding sessions", "Write a label for each AI coding session")
 
 
 def main():
@@ -573,7 +849,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scope", default="live", help="live | today | <N>h  (default live)")
     ap.add_argument("--raw", action="store_true", help="print the extracted digest only; no LLM call")
-    ap.add_argument("--model", default="sonnet", help="model for claude -p (default sonnet)")
+    ap.add_argument("--backend", choices=["auto", "claude", "agy"], default="auto", help="who writes the summary; auto = agy when every session is agy, else claude")
+    ap.add_argument("--model", default="sonnet", help="model when claude writes the report (default sonnet)")
+    ap.add_argument("--agy-model", help="model when agy writes the report (default: agy's configured model; see `agy models`)")
     ap.add_argument("--tool", choices=["all", "claude", "agy"], default="all")
     ap.add_argument("--extra-cmds", default="", help="extra notable-command regex alternation (alternative to DIGEST_EXTRA_CMDS)")
     args = ap.parse_args()
@@ -617,19 +895,14 @@ def main():
         print(body)
         return
 
-    print(f"Summarizing {len(digests)} sessions ({args.scope}, {args.model})…", file=sys.stderr)
-    cmd = [claude_bin(), "-p", "--model", args.model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
-    try:
-        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=SUMMARY_LANG), capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=CLAUDE_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        print(f"claude -p timed out ({CLAUDE_TIMEOUT_S}s)\n--- raw digest ---\n{body}")
+    backend = args.backend if args.backend != "auto" else pick_backend("agy" if all(d["tool"] == "agy" for d in digests) else "claude")
+    model = args.model if backend == "claude" else args.agy_model
+    print(f"Summarizing {len(digests)} sessions ({args.scope}, {backend}{' ' + model if model else ''})…", file=sys.stderr)
+    ok, out = llm(PROMPT.format(body=body, lang=SUMMARY_LANG), backend, model, LLM_TIMEOUT_S)
+    if not ok:
+        print(f"{out}\n--- raw digest ---\n{body}")
         sys.exit(1)
-    if r.returncode != 0 or not r.stdout.strip():
-        print(f"claude -p failed (exit={r.returncode}): {r.stderr.strip()[:500]}\n--- raw digest ---\n{body}")
-        sys.exit(1)
-    print(r.stdout.strip())
-
+    print(out)
 
 if __name__ == "__main__":
     main()

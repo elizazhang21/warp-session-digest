@@ -2,7 +2,7 @@
 """Make Warp's session list show a one-line summary of what each live Claude Code / agy session is doing.
 
 Run periodically (launchd, see install-titles.sh). Each run finds live sessions, re-summarizes the ones that
-changed (one batched `claude -p` call), and pushes the summary to Warp:
+changed (one batched call per tool: `claude -p` for Claude Code, `agy acp` for agy), and pushes the summary to Warp:
   agy          -> terminal title (OSC 0); Warp lists non-agent terminals by title.
   Claude Code  -> Warp lists it by the `query` of its warp://cli-agent events, not the title. While the session
                   is busy we send a `prompt_submit` event (keeps status "working", no notification). Idle sessions
@@ -30,7 +30,7 @@ REFRESH_S = 180          # min seconds between re-summaries of one session (a ne
 BUSY_WINDOW_S = 60       # agy has no status file: busy = transcript written within this window
 SETTLE_S = 5             # don't relabel a Claude session whose busy/idle status flipped this recently
 TITLE_MAX = 48
-CLAUDE_TIMEOUT_S = 120
+LLM_TIMEOUT_S = 120
 
 PROMPT = """Write a label for each AI coding session below: what it is doing **right now** and how far along it is.
 Rules: in {lang}, at most 6 words / 40 characters, task + state, e.g. "Squash today's changes into PR · resolving conflicts",
@@ -70,7 +70,7 @@ def live_sessions():
     # an agy process can hold several conversations; keep the most recently active one per tty
     by_tty, epoch = {}, digest.now() - dt.timedelta(days=365)
     for s in out:
-        if s["d"]["prompts"] and (s["tty"] not in by_tty or (s["d"]["last"] or epoch) > (by_tty[s["tty"]]["d"]["last"] or epoch)):
+        if s["d"]["prompts"] and not digest.is_summarizer(s["d"]) and (s["tty"] not in by_tty or (s["d"]["last"] or epoch) > (by_tty[s["tty"]]["d"]["last"] or epoch)):
             by_tty[s["tty"]] = s
     return list(by_tty.values())
 
@@ -80,24 +80,13 @@ def last_prompt_epoch(d):
     return ts.timestamp() if ts else 0
 
 
-def summarize(items, model):
+def summarize(items, backend, model):
     """items: [(key, digest)] -> {key: title}. One batched call; {} on failure."""
-    claude = digest.claude_bin()
     body = "\n\n".join(f"key: {k}\n" + digest.render(d, max_prompts=6) for k, d in items)
-    cmd = [claude, "-p", "--model", model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
-    kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {}
-    try:
-        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=digest.SUMMARY_LANG), capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=CLAUDE_TIMEOUT_S, **kw)
-    except subprocess.TimeoutExpired:
-        print(f"{time.ctime()} claude -p timed out", file=sys.stderr)
-        return {}
-    except OSError as e:
-        print(f"{time.ctime()} cannot run claude: {e}", file=sys.stderr)
-        return {}
-    m = re.search(r"\{.*\}", r.stdout, re.S)
-    if r.returncode != 0 or not m:
-        print(f"{time.ctime()} claude -p failed exit={r.returncode}: {(r.stderr or r.stdout)[:300]}", file=sys.stderr)
+    ok, out = digest.llm(PROMPT.format(body=body, lang=digest.SUMMARY_LANG), backend, model, LLM_TIMEOUT_S)
+    m = re.search(r"\{.*\}", out, re.S) if ok else None
+    if not m:
+        print(f"{time.ctime()} {out[:300] if not ok else backend + ' returned no JSON: ' + out[:300]}", file=sys.stderr)
         return {}
     try:
         res = json.loads(m.group(0))
@@ -212,7 +201,7 @@ def cc_status_now(pid):
         return None, 0
 
 
-def run_once(model, dry_run):
+def run_once(model, agy_model, dry_run):
     state, now = load_state(), time.time()
     sessions = live_sessions()
 
@@ -225,7 +214,12 @@ def run_once(model, dry_run):
         if not st.get("title") or new_prompt or grew:
             stale.append((s, size))
     if stale:
-        titles = summarize([(s["key"], s["d"]) for s, _ in stale], model)
+        titles = {}
+        for tool in ("cc", "agy"):  # each tool's sessions are summarized by that tool's own CLI
+            items = [(s["key"], s["d"]) for s, _ in stale if s["key"].split(":")[0] == tool]
+            if items:
+                backend = digest.pick_backend("claude" if tool == "cc" else "agy")
+                titles.update(summarize(items, backend, model if backend == "claude" else agy_model))
         for s, size in stale:
             if s["key"] in titles:
                 # stamp with the snapshot time, not completion time: a prompt sent during the call must make this stale
@@ -271,7 +265,8 @@ def _claim_pidfile():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="haiku")
+    ap.add_argument("--model", default="haiku", help="claude model for Claude Code sessions")
+    ap.add_argument("--agy-model", default="gemini-3.8-flash-medium", help="agy model for agy sessions (see `agy models`)")
     ap.add_argument("--dry-run", action="store_true", help="print what would be sent, don't write to ttys")
     ap.add_argument("--lang", default="", help="override DIGEST_LANG")
     ap.add_argument("--loop", type=float, default=0, help="run continuously every N seconds (used by Windows Scheduled Task)")
@@ -296,12 +291,12 @@ def main():
         _claim_pidfile()
         while True:
             try:
-                run_once(args.model, args.dry_run)
+                run_once(args.model, args.agy_model, args.dry_run)
             except Exception as e:
                 print(f"{time.ctime()} error: {e}", file=sys.stderr)
             time.sleep(args.loop)
     else:
-        run_once(args.model, args.dry_run)
+        run_once(args.model, args.agy_model, args.dry_run)
 
 
 if __name__ == "__main__":

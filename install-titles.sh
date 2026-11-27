@@ -18,7 +18,7 @@ cat > "$PLIST" <<PL
   <key>ProgramArguments</key><array><string>$PY</string><string>$REPO/titles.py</string></array>
   <key>StartInterval</key><integer>30</integer>
   <key>RunAtLoad</key><true/>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>DIGEST_LANG</key><string>${DIGEST_LANG:-English}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>DIGEST_LANG</key><string>${DIGEST_LANG:-English}</string></dict>
   <key>StandardOutPath</key><string>$LOG</string>
   <key>StandardErrorPath</key><string>$LOG</string>
 </dict></plist>
