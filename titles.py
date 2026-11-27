@@ -32,9 +32,12 @@ SETTLE_S = 5             # don't relabel a Claude session whose busy/idle status
 TITLE_MAX = 48
 LLM_TIMEOUT_S = 120
 
-PROMPT = """Write a label for each AI coding session below: what it is doing **right now** and how far along it is.
-Rules: in {lang}, at most 6 words / 40 characters, task + state, e.g. "Squash today's changes into PR · resolving conflicts",
-"Grafana lag note · waiting on scan". Base it on the most recent user prompt; no repo name, no trailing punctuation.
+PROMPT = """Write a label for each AI coding session below: **what** code, feature, or change it is working on, plus its current state.
+Rules: in {lang}, at most 6 words / 40 characters, "<substantive work> · <state>", e.g. "OAuth refresh fix · testing",
+"Grafana lag note · waiting on scan".
+Name the actual code change, feature, or bug — never make generic follow-ups ("yes", "ship to GitHub", "commit",
+"push", "retry", "fix it") the topic. If the latest prompt is a follow-up or git/ship command, take the underlying work
+from earlier prompts and edited files as the topic and put the current step in the state. No repo name, no trailing punctuation.
 Output only a JSON object {{"<key>": "<label>", ...}} using the key at the top of each section.
 
 {body}
@@ -266,7 +269,7 @@ def _claim_pidfile():
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="haiku", help="claude model for Claude Code sessions")
-    ap.add_argument("--agy-model", default="gemini-3.8-flash-medium", help="agy model for agy sessions (see `agy models`)")
+    ap.add_argument("--agy-model", default="gemini-3.8-flash-low", help="agy model for agy sessions (see `agy models`)")
     ap.add_argument("--dry-run", action="store_true", help="print what would be sent, don't write to ttys")
     ap.add_argument("--lang", default="", help="override DIGEST_LANG")
     ap.add_argument("--loop", type=float, default=0, help="run continuously every N seconds (used by Windows Scheduled Task)")

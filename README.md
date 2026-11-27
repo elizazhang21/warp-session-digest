@@ -28,7 +28,7 @@ Summaries are in English by default. For another language, run `DIGEST_LANG=Japa
 
 ## Session-list labels
 
-`install-titles.sh` installs a launchd agent that runs `titles.py` every 30s. Each run finds live sessions, re-summarizes the ones that changed (one batched call per tool: `claude -p --model haiku` for Claude Code, `agy acp` with `gemini-3.8-flash-medium` for agy; change with `--model` / `--agy-model`) and caches the labels in `~/.cache/warp-session-digest/titles.json`.
+`install-titles.sh` installs a launchd agent that runs `titles.py` every 30s. Each run finds live sessions, re-summarizes the ones that changed (one batched call per tool: `claude -p --model haiku` for Claude Code, `agy acp` with `gemini-3.8-flash-low` for agy; change with `--model` / `--agy-model`) and caches the labels in `~/.cache/warp-session-digest/titles.json`.
 
 How the label reaches Warp depends on the tool:
 
