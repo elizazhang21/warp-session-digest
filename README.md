@@ -26,6 +26,14 @@ Requires macOS or Windows, Python 3.9+, and the CLI of each tool you use: Claude
 
 Summaries are in English by default. For another language, run `DIGEST_LANG=Japanese ./install-titles.sh` (or `$env:DIGEST_LANG="Japanese"; .\install-titles.ps1` on Windows) and set `DIGEST_LANG` in your shell for `digest.py`. Then remove `~/.cache/warp-session-digest/titles.json` so existing labels are regenerated.
 
+To use a custom summarizer CLI (any command that reads a prompt on stdin and prints the reply on stdout — e.g. a wrapper like `claude-x -p`), set `DIGEST_LLM_CMD` (optional `{model}` placeholder is filled with `--model`; use an absolute path if the binary isn't in `~/.local/bin`, `/opt/homebrew/bin`, or `/usr/local/bin`):
+
+```sh
+DIGEST_LLM_CMD="claude-x -p" ./install-titles.sh   # baked into the launchd agent (or $env:DIGEST_LLM_CMD on Windows)
+DIGEST_LLM_CMD="claude-x -p" ./install.sh          # baked into the Warp workflow
+python3 digest.py --llm-cmd "claude-x -p"          # or pass per run
+```
+
 ## Session-list labels
 
 `install-titles.sh` installs a launchd agent that runs `titles.py` every 30s. Each run finds live sessions, re-summarizes the ones that changed (one batched call per tool: `claude -p --model haiku` for Claude Code, `agy acp` with `gemini-3.8-flash-low` for agy; change with `--model` / `--agy-model`) and caches the labels in `~/.cache/warp-session-digest/titles.json`.
@@ -67,7 +75,8 @@ python3 digest.py --scope today    # everything active since 06:00
 python3 digest.py --scope 8h       # last 8 hours
 python3 digest.py --raw            # print the extracted digest only, no LLM call
 python3 digest.py --tool agy       # only agy (or: claude, all)
-python3 digest.py --backend agy    # who writes the report: auto (default; agy if every session is agy, else claude), claude, agy
+python3 digest.py --backend agy    # who writes the report: auto (default; DIGEST_LLM_CMD if set, else agy if every session is agy, else claude), claude, agy
+python3 digest.py --llm-cmd "claude-x -p"  # custom summarizer command (stdin -> stdout; overrides DIGEST_LLM_CMD)
 python3 digest.py --model haiku    # model when claude writes the report (default sonnet); --agy-model for agy (default: agy's configured model)
 DIGEST_EXTRA_CMDS="mycli deploy" python3 digest.py   # extra commands to surface (regex); ./install.sh bakes it into the workflow
 ```
@@ -83,6 +92,6 @@ Reads local session files only:
 | Claude Code | `~/.claude/sessions/<pid>.json` (pid → sessionId, status) | `~/.claude/projects/*/<sessionId>.jsonl` |
 | agy | `lsof` on the agy process → open `brain/<conversationId>` dirs | `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl` |
 
-For each session it extracts user prompts, edited files, notable commands (git / PR / deploy) and the last replies, then asks `claude -p` or `agy acp` for a summary. `agy acp` runs with an isolated `--gemini-dir` / `--app-data-dir` under `~/.cache/warp-session-digest/agy` that is deleted after the call, so summarizer turns never touch `~/.gemini/antigravity-cli` or show up in agy's conversation history, and any tool permission request is cancelled.
+For each session it extracts user prompts, edited files, notable commands (git / PR / deploy) and the last replies, then asks `claude -p`, `agy acp`, or your `DIGEST_LLM_CMD` for a summary. `claude -p` runs in light-load mode (minimal system prompt, no session persistence, no tools/MCP/plugins/skills, isolated cwd). `agy acp` runs with a minimal no-tools `summarizer` agent in an isolated `--gemini-dir` / `--app-data-dir` under `~/.cache/warp-session-digest/agy` that is deleted after the call, so summarizer turns never touch `~/.gemini/antigravity-cli` or show up in agy's conversation history.
 
 Skipped: the session that launched the script, headless SDK sessions, subagents, sessions with a single short prompt and no edits or commands (health-check probes), and, in `today` / `Nh` scope, Claude Code sessions whose cwd is under `/private/tmp` or `/private/var` (scratch worktrees).

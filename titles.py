@@ -83,10 +83,10 @@ def last_prompt_epoch(d):
     return ts.timestamp() if ts else 0
 
 
-def summarize(items, backend, model):
+def summarize(items, backend, model, llm_cmd=None):
     """items: [(key, digest)] -> {key: title}. One batched call; {} on failure."""
     body = "\n\n".join(f"key: {k}\n" + digest.render(d, max_prompts=6) for k, d in items)
-    ok, out = digest.llm(PROMPT.format(body=body, lang=digest.SUMMARY_LANG), backend, model, LLM_TIMEOUT_S)
+    ok, out = digest.llm(PROMPT.format(body=body, lang=digest.SUMMARY_LANG), backend, model, LLM_TIMEOUT_S, llm_cmd=llm_cmd)
     m = re.search(r"\{.*\}", out, re.S) if ok else None
     if not m:
         print(f"{time.ctime()} {out[:300] if not ok else backend + ' returned no JSON: ' + out[:300]}", file=sys.stderr)
@@ -204,7 +204,7 @@ def cc_status_now(pid):
         return None, 0
 
 
-def run_once(model, agy_model, dry_run):
+def run_once(model, agy_model, dry_run, llm_cmd=""):
     state, now = load_state(), time.time()
     sessions = live_sessions()
 
@@ -218,11 +218,15 @@ def run_once(model, agy_model, dry_run):
             stale.append((s, size))
     if stale:
         titles = {}
-        for tool in ("cc", "agy"):  # each tool's sessions are summarized by that tool's own CLI
-            items = [(s["key"], s["d"]) for s, _ in stale if s["key"].split(":")[0] == tool]
-            if items:
-                backend = digest.pick_backend("claude" if tool == "cc" else "agy")
-                titles.update(summarize(items, backend, model if backend == "claude" else agy_model))
+        custom_cmd = llm_cmd.strip() or digest.LLM_CMD
+        if custom_cmd:
+            titles.update(summarize([(s["key"], s["d"]) for s, _ in stale], "custom", model, llm_cmd=custom_cmd))
+        else:
+            for tool in ("cc", "agy"):  # each tool's sessions are summarized by that tool's own CLI
+                items = [(s["key"], s["d"]) for s, _ in stale if s["key"].split(":")[0] == tool]
+                if items:
+                    backend = digest.pick_backend("claude" if tool == "cc" else "agy")
+                    titles.update(summarize(items, backend, model if backend == "claude" else agy_model))
         for s, size in stale:
             if s["key"] in titles:
                 # stamp with the snapshot time, not completion time: a prompt sent during the call must make this stale
@@ -268,8 +272,10 @@ def _claim_pidfile():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="haiku", help="claude model for Claude Code sessions")
+    ap.add_argument("--model", default="haiku", help="claude model for Claude Code sessions (and {model} placeholder in --llm-cmd)")
     ap.add_argument("--agy-model", default="gemini-3.8-flash-low", help="agy model for agy sessions (see `agy models`)")
+    ap.add_argument("--llm-cmd", default="", help="custom summarizer command reading prompt on stdin (overrides DIGEST_LLM_CMD), e.g. 'claude-x -p'")
+    ap.add_argument("--llm-cmd-b64", default="", help=argparse.SUPPRESS)
     ap.add_argument("--dry-run", action="store_true", help="print what would be sent, don't write to ttys")
     ap.add_argument("--lang", default="", help="override DIGEST_LANG")
     ap.add_argument("--loop", type=float, default=0, help="run continuously every N seconds (used by Windows Scheduled Task)")
@@ -290,16 +296,17 @@ def main():
     if args.lang:
         digest.SUMMARY_LANG = args.lang
 
+    llm_cmd = digest.decode_llm_cmd(args.llm_cmd, args.llm_cmd_b64)
     if args.loop > 0:
         _claim_pidfile()
         while True:
             try:
-                run_once(args.model, args.agy_model, args.dry_run)
+                run_once(args.model, args.agy_model, args.dry_run, llm_cmd)
             except Exception as e:
                 print(f"{time.ctime()} error: {e}", file=sys.stderr)
             time.sleep(args.loop)
     else:
-        run_once(args.model, args.agy_model, args.dry_run)
+        run_once(args.model, args.agy_model, args.dry_run, llm_cmd)
 
 
 if __name__ == "__main__":

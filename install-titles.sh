@@ -10,19 +10,27 @@ LABEL=com.user.warp-session-titles
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/.cache/warp-session-digest/titles.log"
 mkdir -p "$(dirname "$LOG")" "$HOME/Library/LaunchAgents"
-cat > "$PLIST" <<PL
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array><string>$PY</string><string>$REPO/titles.py</string></array>
-  <key>StartInterval</key><integer>30</integer>
-  <key>RunAtLoad</key><true/>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>DIGEST_LANG</key><string>${DIGEST_LANG:-English}</string></dict>
-  <key>StandardOutPath</key><string>$LOG</string>
-  <key>StandardErrorPath</key><string>$LOG</string>
-</dict></plist>
-PL
+PY="$PY" REPO="$REPO" LABEL="$LABEL" LOG="$LOG" PLIST="$PLIST" python3 - <<'PY'
+import os, plistlib
+env = {
+    "PATH": f"{os.environ['HOME']}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "DIGEST_LANG": os.environ.get("DIGEST_LANG") or "English",
+}
+llm_cmd = os.environ.get("DIGEST_LLM_CMD", "").strip()
+if llm_cmd:
+    env["DIGEST_LLM_CMD"] = llm_cmd
+plist = {
+    "Label": os.environ["LABEL"],
+    "ProgramArguments": [os.environ["PY"], os.path.join(os.environ["REPO"], "titles.py")],
+    "StartInterval": 30,
+    "RunAtLoad": True,
+    "EnvironmentVariables": env,
+    "StandardOutPath": os.environ["LOG"],
+    "StandardErrorPath": os.environ["LOG"],
+}
+with open(os.environ["PLIST"], "wb") as f:
+    plistlib.dump(plist, f)
+PY
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 # bootout is async; bootstrap fails with EIO while the old job is still registered
 for _ in 1 2 3 4 5 6 7 8 9 10; do launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break; sleep 0.5; done

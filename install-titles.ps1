@@ -1,12 +1,13 @@
 # Install a Windows Scheduled Task that keeps Warp session titles = one-line summaries (runs titles.py every 30s),
 # and swap Warp's official Claude Code plugin for the fork in claude-plugin/.
-# Optional: $env:DIGEST_LANG="Japanese"; .\install-titles.ps1
+# Optional: $env:DIGEST_LANG="Japanese"; $env:DIGEST_LLM_CMD="claude-x -p"; .\install-titles.ps1
 # Uninstall: .\uninstall-titles.ps1
 $ErrorActionPreference = "Stop"
 
 $Repo = $PSScriptRoot
 $TaskName = "WarpSessionDigestTitles"
 $Lang = if ($env:DIGEST_LANG) { $env:DIGEST_LANG } else { "English" }
+$LlmCmd = if ($env:DIGEST_LLM_CMD) { $env:DIGEST_LLM_CMD.Trim() } else { "" }
 $CacheDir = Join-Path $env:USERPROFILE ".cache\warp-session-digest"
 $LogPath = Join-Path $CacheDir "titles.log"
 $PidFile = Join-Path $CacheDir "titles.pid"
@@ -31,6 +32,10 @@ if (Test-Path $PidFile) {
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $Args = "`"$TitlesPy`" --loop 30 --lang `"$Lang`" --log `"$LogPath`""
+if ($LlmCmd) {
+    $LlmB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($LlmCmd))
+    $Args += " --llm-cmd-b64 $LlmB64"
+}
 $Action = New-ScheduledTaskAction -Execute $PyExe -Argument $Args -WorkingDirectory $Repo
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $Settings = New-ScheduledTaskSettingsSet `

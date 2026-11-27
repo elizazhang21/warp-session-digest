@@ -6,10 +6,11 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/.warp/workflows"
 REPO="$REPO" python3 - <<'PY'
 import json, os, re, shlex
-repo, extra = os.environ["REPO"], os.environ.get("DIGEST_EXTRA_CMDS", "")
+repo, extra, llm_cmd = os.environ["REPO"], os.environ.get("DIGEST_EXTRA_CMDS", ""), os.environ.get("DIGEST_LLM_CMD", "").strip()
 if extra:
     re.compile(extra)  # fail at install time, not inside Warp
-cmd = (f"DIGEST_EXTRA_CMDS={shlex.quote(extra)} " if extra else "") + f"python3 {shlex.quote(repo + '/digest.py')} --scope {{{{scope}}}}"
+prefix = (f"DIGEST_EXTRA_CMDS={shlex.quote(extra)} " if extra else "") + (f"DIGEST_LLM_CMD={shlex.quote(llm_cmd)} " if llm_cmd else "")
+cmd = prefix + f"python3 {shlex.quote(repo + '/digest.py')} --scope {{{{scope}}}}"
 src = open(f"{repo}/workflows/ai-session-digest.yaml").read()
 src = re.sub(r"(?m)^command: .*$", lambda _: "command: " + json.dumps(cmd, ensure_ascii=False), src)
 dst = os.path.expanduser("~/.warp/workflows/ai-session-digest.yaml")

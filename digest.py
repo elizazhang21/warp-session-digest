@@ -9,6 +9,7 @@ Scopes: live = sessions attached to a terminal right now (what Warp's switcher s
 today = everything active since 06:00 (previous day before 06:00); <N>h = everything active in the last N hours.
 """
 import argparse
+import base64
 import ctypes
 import datetime as dt
 import glob
@@ -16,6 +17,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -44,6 +46,7 @@ EDIT_TOOLS_CC = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 NOISE_PREFIX = ("<local-command", "<task-notification", "<system-reminder", "<bash-input", "<bash-stdout", "<bash-stderr", "Caveat: The messages below", "[Request interrupted", "This session is being continued")
 LLM_TIMEOUT_S = 300
 SUMMARY_LANG = os.environ.get("DIGEST_LANG", "English")  # language of generated summaries and labels
+LLM_CMD = os.environ.get("DIGEST_LLM_CMD", "").strip()  # optional custom summarizer command (reads prompt on stdin, prints reply on stdout), e.g. "claude-x -p"
 NO_TTY = ("??", "?", "-")  # macOS / Linux ps spelling of "no controlling terminal"
 
 
@@ -534,15 +537,38 @@ def agy_resolve_model(requested, available):
     return requested
 
 
+AGY_AGENT_MD = """---
+name: summarizer
+description: Concise session summarizer.
+tools: []
+mainAgent: true
+subagent: false
+mcpServers: []
+skills: []
+---
+You are a concise summarizer.
+"""
+
+
 def agy_acp(exe, prompt, model, timeout):
-    """One isolated `agy acp` turn: writes state to a per-call dir under AGY_WORKDIR, never ~/.gemini/antigravity-cli."""
-    os.makedirs(AGY_WORKDIR, exist_ok=True)
-    state_dir = tempfile.mkdtemp(dir=AGY_WORKDIR, prefix="acp-")
+    """One isolated `agy acp` turn: writes state & a minimal no-tools agent to a per-call dir under AGY_WORKDIR, never ~/.gemini/antigravity-cli."""
+    state_dir = None
+    try:
+        os.makedirs(AGY_WORKDIR, exist_ok=True)
+        state_dir = tempfile.mkdtemp(dir=AGY_WORKDIR, prefix="acp-")
+        agent_dir = os.path.join(state_dir, ".agents", "agents", "summarizer")
+        os.makedirs(agent_dir, exist_ok=True)
+        with open(os.path.join(agent_dir, "agent.md"), "w", encoding="utf-8") as f:
+            f.write(AGY_AGENT_MD)
+    except OSError as e:
+        if state_dir:
+            shutil.rmtree(state_dir, ignore_errors=True)
+        return False, f"cannot prepare agy scratch dir: {e}"
     gemini_dir = os.path.relpath(state_dir, HOME)
-    cmd = [exe, "acp", "--gemini-dir", gemini_dir, "--app-data-dir", "state", "--include-default-customizations=false", "--disable-telemetry"]
+    cmd = [exe, "acp", "--agent", "summarizer", "--gemini-dir", gemini_dir, "--app-data-dir", "state", "--include-default-customizations=false", "--disable-telemetry"]
     popen_kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {"start_new_session": True}
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=AGY_WORKDIR, **popen_kw)
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=state_dir, **popen_kw)
     except OSError as e:
         shutil.rmtree(state_dir, ignore_errors=True)
         return False, f"cannot run agy: {e}"
@@ -680,7 +706,7 @@ def agy_acp(exe, prompt, model, timeout):
         _, err = rpc(1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         if err:
             return False, err
-        res, err = rpc(2, "session/new", {"cwd": AGY_WORKDIR, "mcpServers": []})
+        res, err = rpc(2, "session/new", {"cwd": state_dir, "mcpServers": []})
         if err:
             return False, err
         sid = res.get("sessionId")
@@ -732,8 +758,77 @@ def agy_acp(exe, prompt, model, timeout):
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def llm(prompt, backend, model, timeout):
-    """One non-interactive call. backend: claude | agy; model None = the CLI's default. Returns (ok, text or error)."""
+def split_cmd(cmd_str):
+    """Split a command string into argv using native rules (CommandLineToArgvW on Windows, shlex on POSIX)."""
+    if not cmd_str or not cmd_str.strip():
+        return []
+    if IS_WIN:
+        import ctypes.wintypes as w
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        shell32.CommandLineToArgvW.argtypes = [w.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+        shell32.CommandLineToArgvW.restype = ctypes.POINTER(w.LPWSTR)
+        k32.LocalFree.argtypes = [w.HLOCAL]
+        argc = ctypes.c_int(0)
+        argv = shell32.CommandLineToArgvW(cmd_str, ctypes.byref(argc))
+        if not argv:
+            raise ValueError("CommandLineToArgvW failed")
+        try:
+            return [argv[i] for i in range(argc.value)]
+        finally:
+            k32.LocalFree(argv)
+    return shlex.split(cmd_str)
+
+
+def decode_llm_cmd(raw, raw_b64):
+    if raw_b64:
+        try:
+            return base64.b64decode(raw_b64).decode("utf-8").strip()
+        except (ValueError, UnicodeDecodeError) as e:
+            sys.exit(f"bad --llm-cmd-b64: {e}")
+    return (raw or "").strip()
+
+
+def custom_llm(cmd_str, prompt, model, timeout):
+    """Run a user-configured summarizer command (reads prompt on stdin, prints reply on stdout). Supports optional {model} placeholder."""
+    try:
+        parts = split_cmd(cmd_str)
+    except ValueError as e:
+        return False, f"bad llm command {cmd_str!r}: {e}"
+    if not parts or not parts[0]:
+        return False, "empty llm command"
+    if any("{model}" in p for p in parts):
+        if not model:
+            return False, "{model} placeholder requires --model"
+        cmd = [p.replace("{model}", model) for p in parts]
+    else:
+        cmd = list(parts)
+    exe = os.path.expanduser(cmd[0])
+    if os.path.sep in exe or (os.altsep and os.altsep in exe):
+        cmd[0] = os.path.abspath(exe)
+    else:
+        cmd[0] = find_bin(exe) or exe
+    kw = {"cwd": AGY_WORKDIR}
+    if IS_WIN:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        os.makedirs(AGY_WORKDIR, exist_ok=True)
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **kw)
+        stdout, stderr, rc = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired:
+        return False, f"{parts[0]} timed out ({timeout}s)"
+    except OSError as e:
+        return False, f"cannot run {parts[0]}: {e}"
+    if rc != 0 or not (stdout or "").strip():
+        return False, f"{parts[0]} failed (exit={rc}): {(stderr or stdout or '').strip()[:500]}"
+    return True, stdout.strip()
+
+
+def llm(prompt, backend, model, timeout, llm_cmd=None):
+    """One non-interactive call. backend: claude | agy | custom; model None = the CLI's default. Returns (ok, text or error)."""
+    if backend == "custom":
+        cmd_str = (llm_cmd or LLM_CMD).strip()
+        return custom_llm(cmd_str, prompt, model, timeout)
     exe = find_bin(backend)
     if not exe:
         return False, f"cannot run {backend}: not found"
@@ -856,8 +951,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scope", default="live", help="live | today | <N>h  (default live)")
     ap.add_argument("--raw", action="store_true", help="print the extracted digest only; no LLM call")
-    ap.add_argument("--backend", choices=["auto", "claude", "agy"], default="auto", help="who writes the summary; auto = agy when every session is agy, else claude")
-    ap.add_argument("--model", default="sonnet", help="model when claude writes the report (default sonnet)")
+    ap.add_argument("--backend", choices=["auto", "claude", "agy"], default="auto", help="who writes the summary; auto = DIGEST_LLM_CMD if set, else agy when every session is agy, else claude")
+    ap.add_argument("--llm-cmd", default="", help="custom summarizer command reading prompt on stdin (overrides DIGEST_LLM_CMD and --backend), e.g. 'claude-x -p'")
+    ap.add_argument("--llm-cmd-b64", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--model", default="sonnet", help="model when claude writes the report, and {model} placeholder in --llm-cmd (default sonnet)")
     ap.add_argument("--agy-model", help="model when agy writes the report (default: agy's configured model; see `agy models`)")
     ap.add_argument("--tool", choices=["all", "claude", "agy"], default="all")
     ap.add_argument("--extra-cmds", default="", help="extra notable-command regex alternation (alternative to DIGEST_EXTRA_CMDS)")
@@ -902,10 +999,21 @@ def main():
         print(body)
         return
 
-    backend = args.backend if args.backend != "auto" else pick_backend("agy" if all(d["tool"] == "agy" for d in digests) else "claude")
-    model = args.model if backend == "claude" else args.agy_model
-    print(f"Summarizing {len(digests)} sessions ({args.scope}, {backend}{' ' + model if model else ''})…", file=sys.stderr)
-    ok, out = llm(PROMPT.format(body=body, lang=SUMMARY_LANG), backend, model, LLM_TIMEOUT_S)
+    cli_llm_cmd = decode_llm_cmd(args.llm_cmd, args.llm_cmd_b64)
+    custom_cmd = cli_llm_cmd or (LLM_CMD if args.backend == "auto" else "")
+    if custom_cmd:
+        backend, model = "custom", args.model
+        try:
+            parts = split_cmd(custom_cmd)
+            label = os.path.basename(parts[0]) if parts else "custom"
+        except ValueError:
+            label = "custom"
+    else:
+        backend = args.backend if args.backend != "auto" else pick_backend("agy" if all(d["tool"] == "agy" for d in digests) else "claude")
+        model = args.model if backend == "claude" else args.agy_model
+        label = backend + (f" {model}" if model else "")
+    print(f"Summarizing {len(digests)} sessions ({args.scope}, {label})…", file=sys.stderr)
+    ok, out = llm(PROMPT.format(body=body, lang=SUMMARY_LANG), backend, model, LLM_TIMEOUT_S, llm_cmd=custom_cmd)
     if not ok:
         print(f"{out}\n--- raw digest ---\n{body}")
         sys.exit(1)

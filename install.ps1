@@ -13,16 +13,18 @@ New-Item -ItemType Directory -Force -Path $WorkflowDir | Out-Null
 $env:REPO = $Repo
 $env:WORKFLOW_DST = Join-Path $WorkflowDir "ai-session-digest.yaml"
 @'
-import json, os, re
+import base64, json, os, re
 
 repo = os.environ["REPO"]
 dst = os.environ["WORKFLOW_DST"]
 extra = os.environ.get("DIGEST_EXTRA_CMDS", "")
+llm_cmd = os.environ.get("DIGEST_LLM_CMD", "").strip()
 if extra:
     re.compile(extra)  # fail at install time, not inside Warp
 digest_py = os.path.join(repo, "digest.py")
 extra_arg = f' --extra-cmds "{extra}"' if extra else ""
-cmd = f'python3 "{digest_py}"{extra_arg} --scope {{{{scope}}}}'
+llm_arg = f" --llm-cmd-b64 {base64.b64encode(llm_cmd.encode('utf-8')).decode('ascii')}" if llm_cmd else ""
+cmd = f'python3 "{digest_py}"{extra_arg}{llm_arg} --scope {{{{scope}}}}'
 with open(os.path.join(repo, "workflows", "ai-session-digest.yaml"), encoding="utf-8") as fh:
     src = fh.read()
 src = re.sub(r"(?m)^command: .*$", lambda _: "command: " + json.dumps(cmd, ensure_ascii=False), src)
