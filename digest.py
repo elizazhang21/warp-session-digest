@@ -739,9 +739,16 @@ def llm(prompt, backend, model, timeout):
         return False, f"cannot run {backend}: not found"
     if backend == "agy":
         return agy_acp(exe, prompt, model, timeout)
-    cmd = [exe, "-p", "--no-session-persistence", "--tools", "", "--setting-sources", ""] + (["--model", model] if model else [])
-    kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {}
+    cmd = [
+        exe, "-p", "--no-session-persistence", "--tools", "", "--setting-sources", "",
+        "--strict-mcp-config", "--disable-slash-commands", "--no-chrome",
+        "--system-prompt", "You are a concise summarizer.",
+    ] + (["--model", model] if model else [])
+    kw = {"cwd": AGY_WORKDIR, "env": {**os.environ, "CLAUDE_CODE_SAFE_MODE": "1"}}
+    if IS_WIN:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
+        os.makedirs(AGY_WORKDIR, exist_ok=True)
         r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **kw)
         stdout, stderr, rc = r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired:
