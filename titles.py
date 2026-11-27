@@ -10,11 +10,11 @@ changed (one batched `claude -p` call), and pushes the summary to Warp:
                   Stop hook (claude-plugin/), which reads the summary from STATE.
 """
 import argparse
+import ctypes
 import datetime as dt
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +23,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import digest  # noqa: E402
 
-STATE = os.environ.get("WARP_DIGEST_STATE") or os.path.expanduser("~/.cache/warp-session-digest/titles.json")
+IS_WIN = sys.platform == "win32"
+STATE = os.environ.get("WARP_DIGEST_STATE") or os.path.join(os.path.expanduser("~"), ".cache", "warp-session-digest", "titles.json")
+PIDFILE = os.path.join(os.path.dirname(STATE), "titles.pid")
 REFRESH_S = 180          # min seconds between re-summaries of one session (a new prompt bypasses this)
 BUSY_WINDOW_S = 60       # agy has no status file: busy = transcript written within this window
 SETTLE_S = 5             # don't relabel a Claude session whose busy/idle status flipped this recently
@@ -41,7 +43,8 @@ Output only a JSON object {{"<key>": "<label>", ...}} using the key at the top o
 
 def load_state():
     try:
-        s = json.load(open(STATE))
+        with open(STATE, encoding="utf-8", errors="replace") as f:
+            s = json.load(f)
         return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -50,7 +53,7 @@ def load_state():
 def save_state(state):
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".titles.")
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE)
 
@@ -79,11 +82,13 @@ def last_prompt_epoch(d):
 
 def summarize(items, model):
     """items: [(key, digest)] -> {key: title}. One batched call; {} on failure."""
-    claude = shutil.which("claude") or "/opt/homebrew/bin/claude"
+    claude = digest.claude_bin()
     body = "\n\n".join(f"key: {k}\n" + digest.render(d, max_prompts=6) for k, d in items)
     cmd = [claude, "-p", "--model", model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
+    kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {}
     try:
-        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=digest.SUMMARY_LANG), capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S)
+        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=digest.SUMMARY_LANG), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=CLAUDE_TIMEOUT_S, **kw)
     except subprocess.TimeoutExpired:
         print(f"{time.ctime()} claude -p timed out", file=sys.stderr)
         return {}
@@ -106,7 +111,56 @@ def clean(title):
     return title if len(title) <= TITLE_MAX else title[: TITLE_MAX - 1] + "…"
 
 
+def _win_write_console_inproc(pid, seq):
+    """Attach to target process console on Windows and write an OSC sequence to CONOUT$."""
+    import ctypes.wintypes as w
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.FreeConsole()
+    if not k32.AttachConsole(w.DWORD(pid)):
+        return False
+    try:
+        h = k32.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+        if h == w.HANDLE(-1).value:
+            return False
+        try:
+            mode = w.DWORD()
+            if k32.GetConsoleMode(h, ctypes.byref(mode)) and not (mode.value & 0x0004):
+                k32.SetConsoleMode(h, mode.value | 0x0004)
+            written = w.DWORD()
+            ok = k32.WriteConsoleW(h, ctypes.c_wchar_p(seq), len(seq), ctypes.byref(written), None)
+            return bool(ok)
+        finally:
+            k32.CloseHandle(h)
+    finally:
+        k32.FreeConsole()
+
+
+def _win_has_console():
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if k32.GetConsoleWindow():
+        return True
+    try:
+        return bool((sys.stdout and sys.stdout.isatty()) or (sys.stderr and sys.stderr.isatty()))
+    except Exception:
+        return False
+
+
 def write_tty(tty, seq):
+    if IS_WIN:
+        if not tty.startswith("pid:"):
+            return False
+        pid = int(tty.split(":", 1)[1])
+        if _win_has_console():
+            # Avoid detaching the user's interactive terminal when run manually.
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), "--win-write-pid", str(pid)],
+                               input=seq, text=True, encoding="utf-8", capture_output=True, creationflags=flags)
+            return r.returncode == 0
+        ok = _win_write_console_inproc(pid, seq)
+        if not ok:
+            print(f"{time.ctime()} write console {tty} failed", file=sys.stderr)
+        return ok
     try:
         with open(f"/dev/{tty}", "w") as f:
             f.write(seq)
@@ -151,18 +205,14 @@ def cc_tail(path, nbytes=512 * 1024):
 def cc_status_now(pid):
     """(status, seconds since it last changed) re-read right before sending, to avoid relabelling a session that just stopped."""
     try:
-        m = json.load(open(f"{digest.CC_SESSIONS}/{pid}.json"))
+        with open(os.path.join(digest.CC_SESSIONS, f"{pid}.json"), encoding="utf-8", errors="replace") as f:
+            m = json.load(f)
         return m.get("status"), time.time() - (m.get("statusUpdatedAt") or 0) / 1000
     except (OSError, ValueError):
         return None, 0
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="haiku")
-    ap.add_argument("--dry-run", action="store_true", help="print what would be sent, don't write to ttys")
-    args = ap.parse_args()
-
+def run_once(model, dry_run):
     state, now = load_state(), time.time()
     sessions = live_sessions()
 
@@ -175,7 +225,7 @@ def main():
         if not st.get("title") or new_prompt or grew:
             stale.append((s, size))
     if stale:
-        titles = summarize([(s["key"], s["d"]) for s, _ in stale], args.model)
+        titles = summarize([(s["key"], s["d"]) for s, _ in stale], model)
         for s, size in stale:
             if s["key"] in titles:
                 # stamp with the snapshot time, not completion time: a prompt sent during the call must make this stale
@@ -189,7 +239,7 @@ def main():
         if s["key"].startswith("agy:"):
             busy = time.time() - os.path.getmtime(s["path"]) < BUSY_WINDOW_S if os.path.exists(s["path"]) else False
             label = f"{'●' if busy else '○'} {title}"
-            if args.dry_run:
+            if dry_run:
                 print(f"{s['tty']}\ttitle\t{label}")
             else:
                 write_tty(s["tty"], f"\033]0;{label}\007")  # rewrite every run; harmless, survives title resets
@@ -202,15 +252,56 @@ def main():
             if status != "busy":
                 st.pop("sent", None)  # next busy period starts with the plugin's own prompt label
             continue
-        if args.dry_run:
+        if dry_run:
             print(f"{s['tty']}\tprompt_submit\t{title}")
         elif title != st.get("sent"):
             warp_prompt_submit(s["tty"], s["t"]["session_id"], s["t"].get("session_cwd"), title) and st.update(sent=title)
 
     live_keys = {s["key"] for s in sessions}
     state = {k: v for k, v in state.items() if k in live_keys or now - v.get("at", 0) < 86400}
-    if not args.dry_run:
+    if not dry_run:
         save_state(state)
+
+
+def _claim_pidfile():
+    os.makedirs(os.path.dirname(PIDFILE), exist_ok=True)
+    with open(PIDFILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", default="haiku")
+    ap.add_argument("--dry-run", action="store_true", help="print what would be sent, don't write to ttys")
+    ap.add_argument("--lang", default="", help="override DIGEST_LANG")
+    ap.add_argument("--loop", type=float, default=0, help="run continuously every N seconds (used by Windows Scheduled Task)")
+    ap.add_argument("--log", default="", help="append stdout/stderr to this log file")
+    ap.add_argument("--win-write-pid", type=int, default=0, help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    if args.win_write_pid:
+        seq = sys.stdin.read()
+        sys.exit(0 if _win_write_console_inproc(args.win_write_pid, seq) else 1)
+
+    if args.log:
+        os.makedirs(os.path.dirname(args.log), exist_ok=True)
+        logf = open(args.log, "a", encoding="utf-8", buffering=1)
+        sys.stdout = logf
+        sys.stderr = logf
+
+    if args.lang:
+        digest.SUMMARY_LANG = args.lang
+
+    if args.loop > 0:
+        _claim_pidfile()
+        while True:
+            try:
+                run_once(args.model, args.dry_run)
+            except Exception as e:
+                print(f"{time.ctime()} error: {e}", file=sys.stderr)
+            time.sleep(args.loop)
+    else:
+        run_once(args.model, args.dry_run)
 
 
 if __name__ == "__main__":

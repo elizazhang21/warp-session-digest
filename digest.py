@@ -9,19 +9,23 @@ Scopes: live = sessions attached to a terminal right now (what Warp's switcher s
 today = everything active since 06:00 (previous day before 06:00); <N>h = everything active in the last N hours.
 """
 import argparse
+import ctypes
 import datetime as dt
 import glob
 import json
 import os
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 
+IS_WIN = sys.platform == "win32"
 HOME = os.path.expanduser("~")
-CC_SESSIONS = f"{HOME}/.claude/sessions"
-CC_PROJECTS = f"{HOME}/.claude/projects"
-AGY = f"{HOME}/.gemini/antigravity-cli"
-AGY_TRANSCRIPT = AGY + "/brain/{}/.system_generated/logs/transcript.jsonl"
+CC_SESSIONS = os.path.join(HOME, ".claude", "sessions")
+CC_PROJECTS = os.path.join(HOME, ".claude", "projects")
+AGY = os.path.join(HOME, ".gemini", "antigravity-cli")
+AGY_TRANSCRIPT = os.path.join(AGY, "brain", "{}", ".system_generated", "logs", "transcript.jsonl")
 
 # Commands worth surfacing in the digest; extend with DIGEST_EXTRA_CMDS (a regex alternation, e.g. "mycli deploy|ship\.sh").
 _EXTRA_CMDS = os.environ.get("DIGEST_EXTRA_CMDS", "").strip("|")
@@ -64,8 +68,53 @@ def strip_tags(s):
     return s.strip()
 
 
+def claude_bin():
+    found = shutil.which("claude")
+    if found:
+        return found
+    return "claude" if IS_WIN else "/opt/homebrew/bin/claude"
+
+
+def _win_proc_snapshot():
+    """Windows: pid -> (ppid, exe_name) via CreateToolhelp32Snapshot."""
+    import ctypes.wintypes as w
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", w.DWORD),
+            ("cntUsage", w.DWORD),
+            ("th32ProcessID", w.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", w.DWORD),
+            ("cntThreads", w.DWORD),
+            ("th32ParentProcessID", w.DWORD),
+            ("pcPriClassBase", w.LONG),
+            ("dwFlags", w.DWORD),
+            ("szExeFile", w.WCHAR * 260),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snap == w.HANDLE(-1).value:
+        return {}
+    rows = {}
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if k32.Process32FirstW(snap, ctypes.byref(pe)):
+            while True:
+                rows[int(pe.th32ProcessID)] = (int(pe.th32ParentProcessID), pe.szExeFile)
+                if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                    break
+    finally:
+        k32.CloseHandle(snap)
+    return rows
+
+
 def ps_table():
     """pid -> (tty, start datetime or None, command)."""
+    if IS_WIN:
+        return {pid: (f"pid:{pid}", None, exe) for pid, (_, exe) in _win_proc_snapshot().items()}
     out = subprocess.run(["ps", "-axo", "pid=,tty=,lstart=,command="], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}).stdout
     rows = {}
     for line in out.splitlines():
@@ -93,9 +142,12 @@ def ancestors():
     global _ANC
     if _ANC is None:
         _ANC, pid = set(), os.getpid()
-        out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
-        parent = {int(a): int(b) for a, b in (l.split() for l in out.splitlines() if l.strip())}
-        while pid in parent and pid > 1:
+        if IS_WIN:
+            parent = {p: pp for p, (pp, _) in _win_proc_snapshot().items()}
+        else:
+            out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
+            parent = {int(a): int(b) for a, b in (l.split() for l in out.splitlines() if l.strip())}
+        while pid in parent and pid > 1 and pid not in _ANC:
             _ANC.add(pid)
             pid = parent[pid]
     return _ANC
@@ -105,9 +157,10 @@ def ancestors():
 
 def cc_session_registry():
     out = []
-    for f in glob.glob(f"{CC_SESSIONS}/*.json"):
+    for f in glob.glob(os.path.join(CC_SESSIONS, "*.json")):
         try:
-            meta = json.load(open(f))
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                meta = json.load(fh)
         except (OSError, ValueError):
             continue
         if isinstance(meta, dict) and meta.get("pid") and meta.get("sessionId"):
@@ -149,7 +202,7 @@ def cc_prompt(e, local):
 
 
 def cc_transcript_path(session_id):
-    hits = glob.glob(f"{CC_PROJECTS}/*/{session_id}.jsonl")
+    hits = glob.glob(os.path.join(CC_PROJECTS, "*", f"{session_id}.jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
 
 
@@ -160,7 +213,7 @@ def cc_targets(scope_since, live, procs):
     if live:
         for meta in registry:
             pid = meta["pid"]
-            if not on_tty(procs, pid) or meta.get("kind") != "interactive" or "claude" not in procs[pid][2]:
+            if not on_tty(procs, pid) or meta.get("kind") != "interactive" or "claude" not in procs[pid][2].lower():
                 continue
             if meta["sessionId"] in own:
                 continue
@@ -169,8 +222,8 @@ def cc_targets(scope_since, live, procs):
                 targets.append({"path": path, "status": meta.get("status"), "pid": pid, "tty": procs[pid][0],
                                 "session_id": meta["sessionId"], "session_cwd": meta.get("cwd")})
     else:
-        for path in glob.glob(f"{CC_PROJECTS}/*/*.jsonl"):
-            if "-private-tmp-" in path or "-private-var-" in path:
+        for path in glob.glob(os.path.join(CC_PROJECTS, "*", "*.jsonl")):
+            if "-private-tmp-" in path or "-private-var-" in path or "-AppData-Local-Temp-" in path:
                 continue  # A/B harness and scratch worktrees
             if os.path.basename(path)[:-6] in own:
                 continue
@@ -186,7 +239,9 @@ def new_digest(tool, **kw):
 def cc_digest(t, since):
     d = new_digest("Claude Code", **{k: t[k] for k in ("status", "pid", "tty") if t.get(k)})
     custom_title, local = None, False
-    for line in open(t["path"], errors="replace"):
+    with open(t["path"], encoding="utf-8", errors="replace") as fh:
+        lines = list(fh)
+    for line in lines:
         try:
             e = json.loads(line)
         except ValueError:
@@ -235,29 +290,118 @@ def cc_digest(t, since):
 
 # ---------------- agy ----------------
 
+def _uri_to_path(uri):
+    if not uri:
+        return None
+    if IS_WIN and uri.startswith("file:///"):
+        return uri[len("file:///"):]
+    return uri.removeprefix("file://")
+
+
 def agy_meta():
-    """conversation id -> (title, workspace). The cache lags and misses new conversations; titles only."""
-    try:
-        convs = json.load(open(f"{AGY}/cache/conversation_metadata.json"))["conversations"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return {}
+    """conversation id -> (title, workspace). Reads legacy JSON cache and/or conversation_summaries.db."""
     out = {}
-    for cid, v in convs.items():
-        s = (v or {}).get("summary") or {}
-        ws = [u.removeprefix("file://") for u in s.get("WorkspaceURIs") or []]
-        out[cid] = (s.get("Title") or None, ws[0] if ws else None)
+    try:
+        with open(os.path.join(AGY, "cache", "conversation_metadata.json"), encoding="utf-8", errors="replace") as fh:
+            convs = json.load(fh)["conversations"]
+        for cid, v in convs.items():
+            s = (v or {}).get("summary") or {}
+            ws = [_uri_to_path(u) for u in s.get("WorkspaceURIs") or []]
+            out[cid] = (s.get("Title") or None, ws[0] if ws else None)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    db_path = os.path.join(AGY, "conversation_summaries.db")
+    if os.path.exists(db_path):
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                for cid, title, ws_json in con.execute("SELECT conversation_id, title, workspace_uris FROM conversation_summaries"):
+                    if cid in out and out[cid][0] and out[cid][1]:
+                        continue
+                    try:
+                        ws = [_uri_to_path(u) for u in (json.loads(ws_json) if ws_json else [])]
+                    except ValueError:
+                        ws = []
+                    prev_t, prev_w = out.get(cid, (None, None))
+                    out[cid] = (prev_t or title or None, prev_w or (ws[0] if ws else None))
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
     return out
 
 
+def _win_agy_lock_owners():
+    """Windows: pid -> sorted [conversationId, ...] using Restart Manager on presence/*.lock."""
+    import ctypes.wintypes as w
+
+    class RM_UNIQUE_PROCESS(ctypes.Structure):
+        _fields_ = [("dwProcessId", w.DWORD), ("ProcessStartTime", w.FILETIME)]
+
+    class RM_PROCESS_INFO(ctypes.Structure):
+        _fields_ = [
+            ("Process", RM_UNIQUE_PROCESS),
+            ("strAppName", w.WCHAR * 256),
+            ("strServiceShortName", w.WCHAR * 64),
+            ("ApplicationType", w.UINT),
+            ("AppStatus", w.ULONG),
+            ("TSSessionId", w.DWORD),
+            ("bRestartable", w.BOOL),
+        ]
+
+    try:
+        rstrtmgr = ctypes.WinDLL("rstrtmgr")
+    except OSError:
+        return {}
+    by_pid = {}
+    for lp in glob.glob(os.path.join(AGY, "presence", "*.lock")):
+        m = re.fullmatch(r"([0-9a-f-]{36})\.lock", os.path.basename(lp), re.I)
+        if not m:
+            continue
+        cid = m.group(1)
+        sess = w.DWORD()
+        key = ctypes.create_unicode_buffer(64)
+        if rstrtmgr.RmStartSession(ctypes.byref(sess), 0, key) != 0:
+            continue
+        try:
+            arr = (w.LPCWSTR * 1)(os.path.abspath(lp))
+            if rstrtmgr.RmRegisterResources(sess, 1, arr, 0, None, 0, None) != 0:
+                continue
+            needed, count, reason = w.UINT(0), w.UINT(0), w.DWORD(0)
+            rstrtmgr.RmGetList(sess, ctypes.byref(needed), ctypes.byref(count), None, ctypes.byref(reason))
+            if needed.value:
+                buf = (RM_PROCESS_INFO * needed.value)()
+                count = w.UINT(needed.value)
+                if rstrtmgr.RmGetList(sess, ctypes.byref(needed), ctypes.byref(count), buf, ctypes.byref(reason)) == 0:
+                    for i in range(count.value):
+                        pid = int(buf[i].Process.dwProcessId)
+                        by_pid.setdefault(pid, set()).add(cid)
+        finally:
+            rstrtmgr.RmEndSession(sess)
+    return {pid: sorted(cids) for pid, cids in by_pid.items()}
+
+
 def agy_open_convs(pid):
+    if IS_WIN:
+        return _win_agy_lock_owners().get(int(pid), [])
     out = subprocess.run(["lsof", "-p", str(pid), "-Fn"], capture_output=True, text=True).stdout
     return sorted(set(re.findall(r"antigravity-cli/brain/([0-9a-f-]{36})", out)))
 
 
-def agy_own_convs():
+def agy_own_convs(win_owners=None):
     """Conversations held by an agy ancestor of this script (the session that launched it)."""
-    out = subprocess.run(["ps", "-o", "pid=,command=", "-p", ",".join(map(str, ancestors()))], capture_output=True, text=True).stdout
     own = set()
+    if os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+        own.add(os.environ["ANTIGRAVITY_CONVERSATION_ID"])
+    if IS_WIN:
+        snap = _win_proc_snapshot()
+        owners = win_owners if win_owners is not None else _win_agy_lock_owners()
+        for pid in ancestors():
+            exe = (snap.get(pid) or (0, ""))[1]
+            if re.match(r"agy(\.exe)?$", exe, re.I):
+                own.update(owners.get(pid, []))
+        return own
+    out = subprocess.run(["ps", "-o", "pid=,command=", "-p", ",".join(map(str, ancestors()))], capture_output=True, text=True).stdout
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
         if re.match(r"(\S*/)?agy(\s|$)", cmd.strip()):
@@ -266,19 +410,22 @@ def agy_own_convs():
 
 
 def agy_targets(scope_since, live, procs):
-    meta, own = agy_meta(), agy_own_convs()
+    win_owners = _win_agy_lock_owners() if (IS_WIN and live) else None
+    meta, own = agy_meta(), agy_own_convs(win_owners)
     if not live:
         ids = []
         for path in glob.glob(AGY_TRANSCRIPT.format("*")):
             if dt.datetime.fromtimestamp(os.path.getmtime(path)).astimezone() >= scope_since:
-                ids.append(path.split("/brain/")[1].split("/")[0])
+                cid = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+                ids.append(cid)
         return [{"id": cid, "meta": meta.get(cid)} for cid in ids if cid not in own]
-    # live: each agy process on a tty holds brain/<conversationId> dirs open; that is the authoritative mapping.
+    # live: each agy process on a tty holds brain/<conversationId> dirs (or presence/<cid>.lock on Windows).
     targets, seen = [], set()
     for pid, (tty, _, cmd) in procs.items():
-        if tty in NO_TTY or not re.match(r"(\S*/)?agy(\s|$)", cmd) or pid in ancestors():
+        if tty in NO_TTY or not re.match(r"(\S*[/\\])?agy(\.exe)?(\s|$)", cmd, re.I) or pid in ancestors():
             continue
-        for cid in agy_open_convs(pid):
+        convs = win_owners.get(pid, []) if IS_WIN else agy_open_convs(pid)
+        for cid in convs:
             if cid not in seen and cid not in own and os.path.exists(AGY_TRANSCRIPT.format(cid)):
                 seen.add(cid)
                 targets.append({"id": cid, "meta": meta.get(cid), "pid": pid, "tty": tty})
@@ -298,7 +445,9 @@ def unquote(v):
 def agy_digest(t, since):
     title, ws = t.get("meta") or (None, None)
     d = new_digest("agy", title=title, cwd=ws, **{k: t[k] for k in ("pid", "tty") if t.get(k)})
-    for line in open(AGY_TRANSCRIPT.format(t["id"]), errors="replace"):
+    with open(AGY_TRANSCRIPT.format(t["id"]), encoding="utf-8", errors="replace") as fh:
+        lines = list(fh)
+    for line in lines:
         try:
             e = json.loads(line)
         except ValueError:
@@ -417,12 +566,25 @@ Only use what the excerpts say; if unsure, write "unclear from the log". Don't q
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scope", default="live", help="live | today | <N>h  (default live)")
     ap.add_argument("--raw", action="store_true", help="print the extracted digest only; no LLM call")
     ap.add_argument("--model", default="sonnet", help="model for claude -p (default sonnet)")
     ap.add_argument("--tool", choices=["all", "claude", "agy"], default="all")
+    ap.add_argument("--extra-cmds", default="", help="extra notable-command regex alternation (alternative to DIGEST_EXTRA_CMDS)")
     args = ap.parse_args()
+
+    if args.extra_cmds:
+        global NOTABLE_CMD
+        extra = args.extra_cmds.strip("|")
+        try:
+            NOTABLE_CMD = re.compile(r"\b(git (commit|push|merge|rebase|worktree add)|gh pr|kubectl|helm|terraform apply|docker push|npm publish|deploy|rsync|" + extra + r")\b")
+        except re.error as err:
+            sys.exit(f"bad --extra-cmds regex: {err}")
 
     n = now()
     live = args.scope == "live"
@@ -456,9 +618,10 @@ def main():
         return
 
     print(f"Summarizing {len(digests)} sessions ({args.scope}, {args.model})…", file=sys.stderr)
-    cmd = ["claude", "-p", "--model", args.model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
+    cmd = [claude_bin(), "-p", "--model", args.model, "--no-session-persistence", "--tools", "", "--setting-sources", ""]
     try:
-        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=SUMMARY_LANG), capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S)
+        r = subprocess.run(cmd, input=PROMPT.format(body=body, lang=SUMMARY_LANG), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=CLAUDE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         print(f"claude -p timed out ({CLAUDE_TIMEOUT_S}s)\n--- raw digest ---\n{body}")
         sys.exit(1)

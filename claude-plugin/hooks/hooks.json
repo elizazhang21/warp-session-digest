@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-session-start.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" session-start"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-stop.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" stop"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-notification.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" notification"
           }
         ]
       }
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-permission-request.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" permission-request"
           }
         ]
       }
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-prompt-submit.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" prompt-submit"
           }
         ]
       }
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-post-tool-use.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" post-tool-use"
           }
         ]
       }
@@ -68,7 +68,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/on-stop-failure.sh"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/warp_hook.py\" stop-failure"
           }
         ]
       }

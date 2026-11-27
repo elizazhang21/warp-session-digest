@@ -4,6 +4,8 @@ Make Warp's session list say what each AI coding session (Claude Code, agy / Ant
 
 ## Install
 
+### macOS
+
 ```sh
 git clone https://github.com/elizazhang21/warp-session-digest
 cd warp-session-digest
@@ -11,9 +13,18 @@ cd warp-session-digest
 ./install.sh          # optional: on-demand report as a Warp workflow
 ```
 
-Requires macOS, Python 3.9+, the `claude` CLI (used for summarization via `claude -p`), `jq`, `ps` and `lsof`.
+### Windows (PowerShell)
 
-Summaries are in English by default. For another language, run `DIGEST_LANG=Japanese ./install-titles.sh` (labels; baked into the launchd agent) and set `DIGEST_LANG` in your shell for `digest.py`. Then `rm ~/.cache/warp-session-digest/titles.json` so existing labels are regenerated.
+```powershell
+git clone https://github.com/elizazhang21/warp-session-digest
+cd warp-session-digest
+.\install-titles.ps1  # session-list labels (Scheduled Task + Claude Code plugin)
+.\install.ps1         # optional: on-demand report as a Warp workflow
+```
+
+Requires macOS or Windows, Python 3.9+, and the `claude` CLI (used for summarization via `claude -p`). On macOS, `ps` and `lsof` are used for live session discovery; on Windows, Win32 Toolhelp, Restart Manager, and ConPTY `AttachConsole` are used natively (no extra tools required).
+
+Summaries are in English by default. For another language, run `DIGEST_LANG=Japanese ./install-titles.sh` (or `$env:DIGEST_LANG="Japanese"; .\install-titles.ps1` on Windows) and set `DIGEST_LANG` in your shell for `digest.py`. Then remove `~/.cache/warp-session-digest/titles.json` so existing labels are regenerated.
 
 ## Session-list labels
 
@@ -31,13 +42,19 @@ The plugin in `claude-plugin/` is a fork of [warpdotdev/claude-code-warp](https:
 
 A new prompt shows as-is first; the label replaces it once a fresh summary is ready (usually within a minute). Turns shorter than that end with the prompt as the label.
 
-Uninstall:
+Uninstall (macOS):
 
 ```sh
 launchctl bootout gui/$(id -u)/com.user.warp-session-titles
 rm ~/Library/LaunchAgents/com.user.warp-session-titles.plist
 claude plugin uninstall warp-digest@warp-session-digest
 claude plugin enable warp@claude-code-warp
+```
+
+Uninstall (Windows):
+
+```powershell
+.\uninstall-titles.ps1
 ```
 
 ## On-demand report
